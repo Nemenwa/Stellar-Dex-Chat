@@ -10,7 +10,7 @@ pub mod oracle;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 pub const MIN_TTL: u32 = 518_400; // ~30 days
-pub const MAX_TTL: u32 = 535_680; // ~31 days
+pub const MAX_TTL: u32 = 535_680; // ~31 dayss
 const MAX_REFERENCE_LEN: u32 = 64;
 const MAX_SIGNERS: u32 = 20;
 const WINDOW_LEDGERS: u32 = 17_280; // ~24 hours
