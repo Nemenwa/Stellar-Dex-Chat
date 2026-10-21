@@ -850,6 +850,10 @@ pub enum DataKey {
     WithdrawalExpiryWindow,
     LastLargeDeposit(Address),
     UserDeposited(Address),
+    /// Per-user, per-token available balance (deposited minus reserved withdrawals).
+    /// This tracks the actual funds available for withdrawal requests, unlike
+    /// UserDeposited which is a lifetime total across all tokens.
+    UserAvailableBalance(Address, Address),
     NextActionID,
     QueuedAdminAction(u64),
     LastAdminActionLedger,
@@ -1346,6 +1350,12 @@ impl FiatBridge {
         let new_user_total = user_total.checked_add(amount).ok_or(Error::InternalError)?;
         env.storage().instance().set(&user_key, &new_user_total);
 
+        // Track per-user, per-token available balance
+        let balance_key = DataKey::UserAvailableBalance(from.clone(), token.clone());
+        let user_balance: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        let new_user_balance = user_balance.checked_add(amount).ok_or(Error::InternalError)?;
+        env.storage().instance().set(&balance_key, &new_user_balance);
+
         // Track large deposits for withdrawal cooldown
         let withdraw_threshold: i128 = env
             .storage()
@@ -1697,12 +1707,18 @@ impl FiatBridge {
             .get(&DataKey::TokenRegistry(token.clone()))
             .ok_or(Error::TokenNotWhitelisted)?;
 
+        // Check per-user, per-token available balance
+        let balance_key = DataKey::UserAvailableBalance(to.clone(), token.clone());
+        let user_available: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        if amount > user_available {
+            return Err(Error::InsufficientFunds);
+        }
+
+        // Reserve the amount from user's available balance
+        let new_user_balance = user_available.checked_sub(amount).ok_or(Error::InternalError)?;
+        env.storage().instance().set(&balance_key, &new_user_balance);
+
         // Verify the new liabilities don't exceed net deposited
-        let user_deposited: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::UserDeposited(to.clone()))
-            .unwrap_or(0);
         let new_liabilities = config
             .total_liabilities
             .checked_add(amount)
@@ -1710,7 +1726,7 @@ impl FiatBridge {
         let net_deposited = config
             .total_deposited
             .saturating_sub(config.total_withdrawn);
-        if new_liabilities > net_deposited || amount > user_deposited {
+        if new_liabilities > net_deposited {
             return Err(Error::InsufficientFunds);
         }
 
@@ -1869,6 +1885,13 @@ impl FiatBridge {
         if execute_amount == request.amount {
             Self::remove_from_withdraw_queue(&env, request_id, &request);
         } else {
+            // Release the unexecuted portion back to user's available balance
+            let remaining = request.amount - execute_amount;
+            let balance_key = DataKey::UserAvailableBalance(request.to.clone(), request.token.clone());
+            let user_balance: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+            let new_user_balance = user_balance.checked_add(remaining).ok_or(Error::InternalError)?;
+            env.storage().instance().set(&balance_key, &new_user_balance);
+
             request.amount -= execute_amount;
             env.storage()
                 .persistent()
@@ -1935,6 +1958,12 @@ impl FiatBridge {
             .get(&DataKey::WithdrawQueue(request_id))
             .ok_or(Error::RequestNotFound)?;
 
+        // Release the reserved amount back to user's available balance
+        let balance_key = DataKey::UserAvailableBalance(request.to.clone(), request.token.clone());
+        let user_balance: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        let new_user_balance = user_balance.checked_add(request.amount).ok_or(Error::InternalError)?;
+        env.storage().instance().set(&balance_key, &new_user_balance);
+
         Self::release_liability(&env, &request.token, request.amount)?;
         Self::remove_from_withdraw_queue(&env, request_id, &request);
 
@@ -1979,6 +2008,12 @@ impl FiatBridge {
         if env.ledger().sequence() <= request.queued_ledger.saturating_add(expiry_window) {
             return Err(Error::WithdrawalLocked);
         }
+
+        // Release the reserved amount back to user's available balance
+        let balance_key = DataKey::UserAvailableBalance(request.to.clone(), request.token.clone());
+        let user_balance: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        let new_user_balance = user_balance.checked_add(request.amount).ok_or(Error::InternalError)?;
+        env.storage().instance().set(&balance_key, &new_user_balance);
 
         Self::release_liability(&env, &request.token, request.amount)?;
         Self::remove_from_withdraw_queue(&env, request_id, &request);
@@ -3797,11 +3832,32 @@ impl FiatBridge {
             .limit)
     }
 
-    pub fn get_user_deposited(env: Env, user: Address) -> i128 {
+    /// Returns the lifetime total deposits for a user across all tokens.
+    /// This is a historical aggregate and does not reflect available balance.
+    /// Use `get_user_available_balance` for the actual withdrawable amount per token.
+    pub fn get_user_lifetime_deposited(env: Env, user: Address) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::UserDeposited(user))
             .unwrap_or(0)
+    }
+
+    /// Returns the available balance for a user for a specific token.
+    /// This is the amount that can be requested for withdrawal, accounting for
+    /// all pending withdrawal requests.
+    pub fn get_user_available_balance(env: Env, user: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UserAvailableBalance(user, token))
+            .unwrap_or(0)
+    }
+
+    /// Deprecated: use `get_user_lifetime_deposited` for clarity.
+    /// This method is kept for backward compatibility but returns the lifetime
+    /// total, not the available balance.
+    #[deprecated(note = "use get_user_lifetime_deposited for clarity")]
+    pub fn get_user_deposited(env: Env, user: Address) -> i128 {
+        Self::get_user_lifetime_deposited(env, user)
     }
 
     pub fn get_daily_deposit_record(env: Env, user: Address) -> Option<UserDailyVolume> {
